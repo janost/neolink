@@ -113,6 +113,8 @@ impl Drop for StreamData {
     }
 }
 
+// Second from_parts removed — already defined above
+
 impl BcCamera {
     ///
     /// Starts the video stream
