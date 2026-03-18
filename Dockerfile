@@ -1,10 +1,11 @@
+# syntax=docker/dockerfile:1
 # Neolink Docker image build scripts
 # Copyright (c) 2020 George Hilliard,
 #                    Andrew King,
 #                    Miroslav Šedivý
 # SPDX-License-Identifier: AGPL-3.0-only
 
-FROM docker.io/rust:slim-trixie AS build
+FROM rust:1-slim AS build
 ARG TARGETPLATFORM
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -20,13 +21,18 @@ COPY . /usr/local/src/neolink
 # github runner ops we are not testing the
 # docker to see if it will build from scratch
 # so if it is failing please make a PR
-#
-# hadolint ignore=DL3008
-RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
+RUN rm -f /etc/apt/apt.conf.d/docker-clean; \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/usr/local/src/neolink/target \
+  --mount=type=cache,target=/usr/local/cargo/git/db \
+  --mount=type=cache,target=/usr/local/cargo/registry/ \
+  --mount=type=cache,target=/var/cache/apt,sharing=locked \
+  --mount=type=cache,target=/var/lib/apt,sharing=locked \
+  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
   if [ -f "${TARGETPLATFORM}/neolink" ]; then \
     echo "Restoring from artifact"; \
-    mkdir -p /usr/local/src/neolink/target/release/; \
-    cp "${TARGETPLATFORM}/neolink" "/usr/local/src/neolink/target/release/neolink"; \
+    cp "${TARGETPLATFORM}/neolink" /usr/local/bin/neolink; \
   else \
     echo "Building from scratch"; \
     apt-get update && \
@@ -41,24 +47,27 @@ RUN  echo "TARGETPLATFORM: ${TARGETPLATFORM}"; \
           libgtk2.0-dev \
           protobuf-compiler \
           libglib2.0-dev && \
-        apt-get clean -y && rm -rf /var/lib/apt/lists/* ; \
-    cargo build --release; \
+    cargo build --release && \
+    cp target/release/neolink /usr/local/bin/neolink; \
   fi
 
 # Create the release container. Match the base OS used to build
-FROM debian:trixie-slim
-ARG TARGETPLATFORM
+FROM debian:stable-slim
 ARG REPO
 ARG VERSION
 ARG OWNER
 
-LABEL description="An image for the neolink program which is a reolink camera to rtsp translator"
-LABEL repository="$REPO"
-LABEL version="$VERSION"
-LABEL maintainer="$OWNER"
+LABEL org.opencontainers.image.source="$REPO" \
+      org.opencontainers.image.description="Reolink camera to RTSP translator" \
+      org.opencontainers.image.version="$VERSION" \
+      org.opencontainers.image.vendor="$OWNER"
 
-# hadolint ignore=DL3008
-RUN apt-get update && \
+RUN rm -f /etc/apt/apt.conf.d/docker-clean; \
+    echo 'Binary::apt::APT::Keep-Downloaded-Packages "true";' > /etc/apt/apt.conf.d/keep-cache
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    apt-get update && \
     apt-get upgrade -y && \
     apt-get install -y --no-install-recommends \
         openssl \
@@ -72,22 +81,25 @@ RUN apt-get update && \
         gstreamer1.0-plugins-base \
         gstreamer1.0-plugins-good \
         gstreamer1.0-plugins-bad \
-        gstreamer1.0-libav && \
-    apt-get clean -y && rm -rf /var/lib/apt/lists/*
+        gstreamer1.0-libav
 
-COPY --from=build \
-  /usr/local/src/neolink/target/release/neolink \
-  /usr/local/bin/neolink
+COPY --from=build /usr/local/bin/neolink /usr/local/bin/neolink
 COPY docker/entrypoint.sh /entrypoint.sh
 
 RUN gst-inspect-1.0; \
     chmod +x "/usr/local/bin/neolink" && \
-    "/usr/local/bin/neolink" --version && \
-    mkdir -m 0700 /root/.config/
+    "/usr/local/bin/neolink" --version
+
+RUN groupadd -r -g 10001 neolink && useradd -r -u 10001 -g neolink -d /home/neolink -m neolink && \
+    mkdir -p /home/neolink/.config && chown neolink:neolink /home/neolink/.config
+
+USER neolink
 
 ENV NEO_LINK_MODE="rtsp" NEO_LINK_PORT=8554
 
-CMD /usr/local/bin/neolink "${NEO_LINK_MODE}" --config /etc/neolink.toml
 ENTRYPOINT ["/entrypoint.sh"]
-EXPOSE ${NEO_LINK_PORT}
+CMD ["/usr/local/bin/neolink", "rtsp", "--config", "/etc/neolink.toml"]
+EXPOSE 8554
 
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+  CMD /usr/local/bin/neolink --version || exit 1

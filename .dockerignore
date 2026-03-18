@@ -1,3 +1,10 @@
 target/
 Dockerfile
 .dockerignore
+.git/
+.github/
+.gitignore
+docs/
+tmp/
+*.md
+LICENSE
