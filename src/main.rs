@@ -40,7 +40,9 @@ mod battery;
 mod cmdline;
 mod common;
 mod config;
+mod disk;
 mod encoding;
+mod replay;
 #[cfg(feature = "gstreamer")]
 mod image;
 mod mqtt;
@@ -141,6 +143,12 @@ async fn main() -> Result<()> {
         }
         Some(Command::Battery(opts)) => {
             battery::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Disk(opts)) => {
+            disk::main(opts, neo_reactor.clone()).await?;
+        }
+        Some(Command::Replay(opts)) => {
+            replay::main(opts, neo_reactor.clone()).await?;
         }
         Some(Command::Services(opts)) => {
             services::main(opts, neo_reactor.clone()).await?;
