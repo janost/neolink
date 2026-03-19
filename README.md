@@ -24,16 +24,25 @@ This is a maintained fork of
 which itself was a fork of
 [thirtythreeforty/neolink](https://github.com/thirtythreeforty/neolink).
 
-**Changes in this fork:**
+This fork incorporates community PRs that were submitted to upstream but never
+merged, plus additional improvements:
 
-- Low-latency RTSP mode (`enable_low_latency`) for reduced stream delay
-- Stability fixes: timestamp overflow, memory/FD leaks, pipeline sharing,
-  keepalive backpressure
+**Ported community contributions:**
+
+- Buffer pool bucketing to prevent FD/memory leaks — [@wafgo](https://github.com/wafgo) ([#373](https://github.com/QuantumEntangledAndy/neolink/pull/373))
+- Wireshark dissector fix for deprecated bit32 — [@Maaggs](https://github.com/Maaggs) ([#389](https://github.com/QuantumEntangledAndy/neolink/pull/389))
+- `enable_audio` and `enable_low_latency` config options — [@fromagge](https://github.com/fromagge) ([#394](https://github.com/QuantumEntangledAndy/neolink/pull/394))
+- Encoding subcommand for video compression settings — [@lorek123](https://github.com/lorek123) ([#395](https://github.com/QuantumEntangledAndy/neolink/pull/395))
+- Disk management, SD card replay/download, and alarm search — [@lorek123](https://github.com/lorek123) ([#396](https://github.com/QuantumEntangledAndy/neolink/pull/396))
+- Timestamp overflow fix (u64) preventing corruption after ~71 min — [@joshkautz](https://github.com/joshkautz) ([#398](https://github.com/QuantumEntangledAndy/neolink/pull/398))
+- Channel backpressure fix preventing keepalive timeouts — [@joshkautz](https://github.com/joshkautz) ([#399](https://github.com/QuantumEntangledAndy/neolink/pull/399))
+- Pipeline sharing to prevent per-client resource exhaustion — [@joshkautz](https://github.com/joshkautz) ([#400](https://github.com/QuantumEntangledAndy/neolink/pull/400))
+
+**Additional changes:**
+
+- Low-latency RTSP mode with frame draining, live-mode AppSrc, and reduced buffers
 - Docker images published to GHCR instead of Docker Hub
 - Updated dependencies and Debian Trixie base image
-- Disk management, SD card replay/download, and alarm search
-- Video encoding/compression settings subcommand
-- Audio can be disabled per camera (`enable_audio`)
 
 **Inherited features from upstream:**
 
