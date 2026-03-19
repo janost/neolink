@@ -574,7 +574,7 @@ fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
     let source = make_element("videotestsrc", "testvidsrc")?;
     source.set_property_from_str("pattern", pattern);
     source.set_property("num-buffers", 500i32); // Send buffers then EOS
-    let queue = make_queue("queue0", 1024 * 1024 * 4)?;
+    let queue = make_queue("queue0", 1024 * 1024 * 4, false)?;
 
     let overlay = make_element("textoverlay", "overlay")?;
     overlay.set_property("text", "Stream not Ready");
@@ -632,8 +632,11 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
-    let queue = make_queue("source_queue", buffer_size)?;
+    let queue = make_queue("source_queue", buffer_size, stream_config.enable_low_latency)?;
     let parser = make_element("h264parse", "parser")?;
+    if stream_config.enable_low_latency {
+        parser.set_property("config-interval", -1i32);
+    }
     // let stamper = make_element("h264timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
@@ -685,8 +688,11 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
-    let queue = make_queue("source_queue", buffer_size)?;
+    let queue = make_queue("source_queue", buffer_size, stream_config.enable_low_latency)?;
     let parser = make_element("h265parse", "parser")?;
+    if stream_config.enable_low_latency {
+        parser.set_property("config-interval", -1i32);
+    }
     // let stamper = make_element("h265timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
@@ -716,8 +722,11 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = if stream_config.enable_low_latency {
+        8 * 1024 // ~500ms of 8kHz mono audio
+    } else {
+        512 * 1416
+    };
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -741,7 +750,7 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", buffer_size)?;
+    let queue = make_queue("audqueue", buffer_size, stream_config.enable_low_latency)?;
     let parser = make_element("aacparse", "audparser")?;
     let decoder = match make_element("faad", "auddecoder_faad") {
         Ok(ele) => Ok(ele),
@@ -753,7 +762,12 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     silence.set_property_from_str("wave", "silence");
     let fallback_switch = make_element("fallbackswitch", "audfallbackswitch");
     if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
+        let fb_timeout = if stream_config.enable_low_latency {
+            500_000_000u64 // 500ms
+        } else {
+            3_000_000_000u64 // 3s
+        };
+        fallback_switch.set_property("timeout", fb_timeout);
         fallback_switch.set_property("immediate-fallback", true);
     }
 
@@ -799,7 +813,11 @@ fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = 512 * 1416;
+    let buffer_size = if stream_config.enable_low_latency {
+        8 * 1024 // ~500ms of 8kHz mono audio
+    } else {
+        512 * 1416
+    };
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -838,7 +856,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", buffer_size)?;
+    let queue = make_queue("audqueue", buffer_size, stream_config.enable_low_latency)?;
     let decoder = make_element("decodebin", "auddecoder")?;
     let encoder = make_element("audioconvert", "audencoder")?;
     let encoder_out = encoder.clone();
@@ -878,8 +896,11 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
 
 #[allow(dead_code)]
 fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = if stream_config.enable_low_latency {
+        8 * 1024 // ~500ms of 8kHz mono audio
+    } else {
+        512 * 1416
+    };
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -903,12 +924,12 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let sink_queue = make_queue("audsinkqueue", buffer_size)?;
+    let sink_queue = make_queue("audsinkqueue", buffer_size, stream_config.enable_low_latency)?;
     let sink = make_element("fakesink", "silence_sink")?;
 
     let silence = make_element("audiotestsrc", "audsilence")?;
     silence.set_property_from_str("wave", "silence");
-    let src_queue = make_queue("audsinkqueue", buffer_size)?;
+    let src_queue = make_queue("audsinkqueue", buffer_size, stream_config.enable_low_latency)?;
     let encoder = make_element("audioconvert", "audencoder")?;
 
     bin.add_many([&source, &sink_queue, &sink, &silence, &src_queue, &encoder])?;
@@ -1053,16 +1074,22 @@ fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(bin)
 }
 
-fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
+fn make_queue(name: &str, buffer_size: u32, low_latency: bool) -> AnyResult<Element> {
     let queue = make_element("queue", &format!("queue1_{}", name))?;
     queue.set_property("max-size-bytes", buffer_size);
     queue.set_property("max-size-buffers", 0u32);
-    queue.set_property("max-size-time", 0u64);
-    queue.set_property(
-        "max-size-time",
-        std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
-            .unwrap_or(0),
-    );
+    if low_latency {
+        // 200ms max queue time — ~5 frames at 25fps
+        queue.set_property("max-size-time", 200_000_000u64);
+        // Drop oldest data when full instead of blocking
+        queue.set_property_from_str("leaky", "downstream");
+    } else {
+        queue.set_property(
+            "max-size-time",
+            std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
+                .unwrap_or(0),
+        );
+    }
     Ok(queue)
 }
 
