@@ -251,7 +251,11 @@ async fn apply_users(rtsp: &NeoRtspServer, curr_users: &HashSet<UserConfig>) -> 
 ///
 /// It checks which streams are supported and then starts them
 async fn camera_main(camera: NeoInstance, rtsp: &NeoRtspServer) -> Result<()> {
-    let name = camera.config().await?.borrow().name.clone();
+    let config = camera.config().await?.borrow().clone();
+    let name = config.name.clone();
+    if config.enable_low_latency {
+        log::info!("{name}: Low-latency mode enabled");
+    }
     log::debug!("{name}: Camera Main");
     let later_camera = camera.clone();
     let (supported_streams_tx, supported_streams) = watch(HashSet::<StreamKind>::new());

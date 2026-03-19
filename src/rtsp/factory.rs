@@ -188,7 +188,14 @@ pub(super) async fn make_factory(
                         while let Some(media) = media_rx.recv().await {
                             stream_config.update_from_media(&media);
                             buffer.push(media);
-                            if frame_count > 10
+                            if stream_config.enable_low_latency {
+                                if frame_count > 5
+                                    || (stream_config.vid_type.is_some()
+                                        && stream_config.aud_type.is_some())
+                                {
+                                    break;
+                                }
+                            } else if frame_count > 10
                                 || (stream_config.vid_type.is_some()
                                     && stream_config.aud_type.is_some())
                             {
@@ -273,19 +280,27 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                let frames = if stream_config.enable_low_latency {
+                                    drain_to_latest(data, &mut media_rx)
+                                } else {
+                                    vec![data]
+                                };
+
+                                for frame in frames {
+                                    let r = send_to_sources(
+                                        frame,
+                                        &mut pools,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
+                                        &stream_config,
+                                    );
+                                    if let Err(r) = &r {
+                                        log::info!("Failed to send to source: {r:?}");
+                                    }
+                                    r?;
                                 }
-                                r?;
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
@@ -308,6 +323,42 @@ pub(super) async fn make_factory(
     })
     .await?;
     Ok((factory, thread))
+}
+
+/// In low-latency mode, drain all immediately-available frames from the channel
+/// and return only the latest decodable set (from the last I-frame onward).
+/// If nothing was queued, returns the original frame as-is (zero overhead).
+fn drain_to_latest(
+    first: BcMedia,
+    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
+) -> Vec<BcMedia> {
+    let mut frames = vec![first];
+    while let Ok(frame) = rx.try_recv() {
+        frames.push(frame);
+    }
+
+    if frames.len() <= 1 {
+        return frames;
+    }
+
+    let last_iframe_idx = frames.iter().rposition(|f| matches!(f, BcMedia::Iframe(_)));
+
+    match last_iframe_idx {
+        Some(idx) => {
+            if idx > 0 {
+                log::info!(
+                    "Low-latency: dropping {} stale frames, skipping to latest I-frame",
+                    idx
+                );
+            }
+            frames.split_off(idx)
+        }
+        None => {
+            // No I-frame to resync from — keep all frames to maintain
+            // the P-frame decode chain (each depends on the previous)
+            frames
+        }
+    }
 }
 
 fn send_to_sources(
@@ -334,6 +385,7 @@ fn send_to_sources(
                         aac.data,
                         Duration::from_micros(*aud_ts),
                         pools,
+                        stream_config.enable_low_latency,
                     )?;
                 }
             }
@@ -354,6 +406,7 @@ fn send_to_sources(
                         adpcm.data,
                         Duration::from_micros(*aud_ts),
                         pools,
+                        stream_config.enable_low_latency,
                     )?;
                 }
             }
@@ -363,7 +416,13 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
+                send_to_appsrc(
+                    vid_src,
+                    data,
+                    Duration::from_micros(*vid_ts),
+                    pools,
+                    stream_config.enable_low_latency,
+                )?;
             }
             const MICROSECONDS: u64 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps as u64;
@@ -439,6 +498,7 @@ fn send_to_appsrc(
     data: Vec<u8>,
     mut ts: Duration,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    low_latency: bool,
 ) -> AnyResult<()> {
     check_live(appsrc)?;
 
@@ -472,12 +532,15 @@ fn send_to_appsrc(
         Err(e) => return Err(anyhow!("Error in streaming: {e:?}")),
     }
 
-    let level = appsrc.current_level_bytes();
-    let max = appsrc.max_bytes();
-    if level >= max * 2 / 3 && matches!(appsrc.current_state(), gstreamer::State::Paused) {
-        let _ = appsrc.set_state(gstreamer::State::Playing);
-    } else if level <= max / 3 && matches!(appsrc.current_state(), gstreamer::State::Playing) {
-        let _ = appsrc.set_state(gstreamer::State::Paused);
+    if !low_latency {
+        let level = appsrc.current_level_bytes();
+        let max = appsrc.max_bytes();
+        if level >= max * 2 / 3 && matches!(appsrc.current_state(), gstreamer::State::Paused) {
+            let _ = appsrc.set_state(gstreamer::State::Playing);
+        } else if level <= max / 3 && matches!(appsrc.current_state(), gstreamer::State::Playing)
+        {
+            let _ = appsrc.set_state(gstreamer::State::Paused);
+        }
     }
 
     Ok(())
@@ -513,7 +576,7 @@ fn build_unknown(bin: &Element, pattern: &str) -> Result<()> {
     let source = make_element("videotestsrc", "testvidsrc")?;
     source.set_property_from_str("pattern", pattern);
     source.set_property("num-buffers", 500i32); // Send buffers then EOS
-    let queue = make_queue("queue0", 1024 * 1024 * 4)?;
+    let queue = make_queue("queue0", 1024 * 1024 * 4, false)?;
 
     let overlay = make_element("textoverlay", "overlay")?;
     overlay.set_property("text", "Stream not Ready");
@@ -544,7 +607,7 @@ struct Linked {
 }
 
 fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = buffer_size(stream_config.bitrate);
+    let buffer_size = buffer_size(stream_config.bitrate, stream_config.enable_low_latency);
     log::debug!(
         "buffer_size: {buffer_size}, bitrate: {}",
         stream_config.bitrate
@@ -558,21 +621,24 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
-    let queue = make_queue("source_queue", buffer_size)?;
+    let queue = make_queue("source_queue", buffer_size, stream_config.enable_low_latency)?;
     let parser = make_element("h264parse", "parser")?;
+    if stream_config.enable_low_latency {
+        parser.set_property("config-interval", -1i32);
+    }
     // let stamper = make_element("h264timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
@@ -602,7 +668,7 @@ fn build_h264(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = buffer_size(stream_config.bitrate);
+    let buffer_size = buffer_size(stream_config.bitrate, stream_config.enable_low_latency);
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -611,21 +677,24 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = make_element("appsrc", "vidsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
-    let queue = make_queue("source_queue", buffer_size)?;
+    let queue = make_queue("source_queue", buffer_size, stream_config.enable_low_latency)?;
     let parser = make_element("h265parse", "parser")?;
+    if stream_config.enable_low_latency {
+        parser.set_property("config-interval", -1i32);
+    }
     // let stamper = make_element("h265timestamper", "stamper")?;
 
     bin.add_many([&source, &queue, &parser])?;
@@ -655,8 +724,11 @@ fn build_h265(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = if stream_config.enable_low_latency {
+        8 * 1024 // ~500ms of 8kHz mono audio
+    } else {
+        512 * 1416
+    };
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -666,21 +738,21 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", buffer_size)?;
+    let queue = make_queue("audqueue", buffer_size, stream_config.enable_low_latency)?;
     let parser = make_element("aacparse", "audparser")?;
     let decoder = match make_element("faad", "auddecoder_faad") {
         Ok(ele) => Ok(ele),
@@ -692,7 +764,12 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     silence.set_property_from_str("wave", "silence");
     let fallback_switch = make_element("fallbackswitch", "audfallbackswitch");
     if let Ok(fallback_switch) = fallback_switch.as_ref() {
-        fallback_switch.set_property("timeout", 3u64 * 1_000_000_000u64);
+        let fb_timeout = if stream_config.enable_low_latency {
+            500_000_000u64 // 500ms
+        } else {
+            3_000_000_000u64 // 3s
+        };
+        fallback_switch.set_property("timeout", fb_timeout);
         fallback_switch.set_property("immediate-fallback", true);
     }
 
@@ -738,7 +815,11 @@ fn build_aac(bin: &Element, stream_config: &StreamConfig) -> Result<AppSrc> {
 }
 
 fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> Result<Linked> {
-    let buffer_size = 512 * 1416;
+    let buffer_size = if stream_config.enable_low_latency {
+        8 * 1024 // ~500ms of 8kHz mono audio
+    } else {
+        512 * 1416
+    };
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -754,14 +835,14 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     source.set_caps(Some(
@@ -777,7 +858,7 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let queue = make_queue("audqueue", buffer_size)?;
+    let queue = make_queue("audqueue", buffer_size, stream_config.enable_low_latency)?;
     let decoder = make_element("decodebin", "auddecoder")?;
     let encoder = make_element("audioconvert", "audencoder")?;
     let encoder_out = encoder.clone();
@@ -817,8 +898,11 @@ fn build_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> 
 
 #[allow(dead_code)]
 fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
-    // Audio seems to run at about 800kbs
-    let buffer_size = 512 * 1416;
+    let buffer_size = if stream_config.enable_low_latency {
+        8 * 1024 // ~500ms of 8kHz mono audio
+    } else {
+        512 * 1416
+    };
     let bin = bin
         .clone()
         .dynamic_cast::<Bin>()
@@ -828,26 +912,26 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
         .dynamic_cast::<Element>()
         .map_err(|_| anyhow!("Cannot cast back"))?;
 
-    let sink_queue = make_queue("audsinkqueue", buffer_size)?;
+    let sink_queue = make_queue("audsinkqueue", buffer_size, stream_config.enable_low_latency)?;
     let sink = make_element("fakesink", "silence_sink")?;
 
     let silence = make_element("audiotestsrc", "audsilence")?;
     silence.set_property_from_str("wave", "silence");
-    let src_queue = make_queue("audsinkqueue", buffer_size)?;
+    let src_queue = make_queue("audsinkqueue", buffer_size, stream_config.enable_low_latency)?;
     let encoder = make_element("audioconvert", "audencoder")?;
 
     bin.add_many([&source, &sink_queue, &sink, &silence, &src_queue, &encoder])?;
@@ -992,20 +1076,29 @@ fn make_dbl_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
     Ok(bin)
 }
 
-fn make_queue(name: &str, buffer_size: u32) -> AnyResult<Element> {
+fn make_queue(name: &str, buffer_size: u32, low_latency: bool) -> AnyResult<Element> {
     let queue = make_element("queue", &format!("queue1_{}", name))?;
     queue.set_property("max-size-bytes", buffer_size);
     queue.set_property("max-size-buffers", 0u32);
-    queue.set_property("max-size-time", 0u64);
-    queue.set_property(
-        "max-size-time",
-        std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
-            .unwrap_or(0),
-    );
+    if low_latency {
+        // 200ms max queue time — ~5 frames at 25fps
+        queue.set_property("max-size-time", 200_000_000u64);
+    } else {
+        queue.set_property(
+            "max-size-time",
+            std::convert::TryInto::<u64>::try_into(tokio::time::Duration::from_secs(5).as_nanos())
+                .unwrap_or(0),
+        );
+    }
     Ok(queue)
 }
 
-fn buffer_size(bitrate: u32) -> u32 {
-    // 0.1 seconds (according to bitrate) or 4kb what ever is larger
-    std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+fn buffer_size(bitrate: u32, low_latency: bool) -> u32 {
+    if low_latency {
+        // ~1 frame worth of buffer
+        std::cmp::max(bitrate / 8u32, 4u32 * 1024u32)
+    } else {
+        // ~0.25 seconds of buffer
+        std::cmp::max(bitrate * 2 / 8u32, 4u32 * 1024u32)
+    }
 }

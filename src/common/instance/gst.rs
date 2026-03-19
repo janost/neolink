@@ -18,7 +18,8 @@ impl NeoInstance {
         let name = config.name.clone();
 
         let media_rx = if config.pause.on_motion {
-            let (media_tx, media_rx) = tokio::sync::mpsc::channel(100);
+            let channel_size = if config.enable_low_latency { 5 } else { 100 };
+            let (media_tx, media_rx) = tokio::sync::mpsc::channel(channel_size);
             let counter = UseCounter::new().await;
 
             let mut md = self.motion().await?;
@@ -176,9 +177,11 @@ impl NeoInstance {
 
     /// Streams a camera source
     pub(crate) async fn stream(&self, stream: StreamKind) -> AnyResult<MpscReceiver<BcMedia>> {
-        let (media_tx, media_rx) = tokio::sync::mpsc::channel(100);
         let config = self.config().await?.borrow().clone();
+        let channel_size = if config.enable_low_latency { 5 } else { 100 };
+        let (media_tx, media_rx) = tokio::sync::mpsc::channel(channel_size);
         let strict = config.strict;
+        let low_latency = config.enable_low_latency;
         let thread_camera = self.clone();
         tokio::task::spawn(
             tokio::task::spawn(async move {
@@ -186,7 +189,9 @@ impl NeoInstance {
                     .run_task(move |cam| {
                         let media_tx = media_tx.clone();
                         Box::pin(async move {
-                            let mut media_stream = cam.start_video(stream, 0, strict).await?;
+                            let buffer_size = if low_latency { 5 } else { 0 };
+                            let mut media_stream =
+                                cam.start_video(stream, buffer_size, strict).await?;
                             log::trace!("Camera started");
                             while let Ok(media) = media_stream.get_data().await? {
                                 media_tx.send(media).await?;

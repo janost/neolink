@@ -28,3 +28,8 @@ token.toml
 
 # Debug FCM build
 crates/fcm-push-listener
+
+# Planning and docs (local only)
+.planning/
+docs/plans/
+tmp/
