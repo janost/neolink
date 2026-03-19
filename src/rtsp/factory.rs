@@ -351,14 +351,9 @@ fn drain_to_latest(
             frames.split_off(idx)
         }
         None => {
-            let dropped = frames.len() - 1;
-            if dropped > 0 {
-                log::debug!(
-                    "Low-latency: dropping {} frames (no I-frame in batch)",
-                    dropped
-                );
-            }
-            vec![frames.pop().unwrap()]
+            // No I-frame to resync from — keep all frames to maintain
+            // the P-frame decode chain (each depends on the previous)
+            frames
         }
     }
 }
