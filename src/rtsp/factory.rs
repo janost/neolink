@@ -434,7 +434,7 @@ fn send_to_sources(
 
 fn bucket_size_for(n: usize) -> Option<usize> {
     const MIN_BUCKET: usize = 256;
-    const MAX_BUCKET: usize = 1024 * 1024;
+    const MAX_BUCKET: usize = 4 * 1024 * 1024;
     if n == 0 {
         return Some(MIN_BUCKET);
     }
@@ -465,6 +465,7 @@ fn acquire_pooled_buffer(
             pool
         });
 
+        log::trace!("Pooled buffer: needed={needed}, bucket={bucket}");
         let mut buf = pool.acquire_buffer(None)?;
         {
             let buf_ref = buf.get_mut().unwrap();
@@ -480,6 +481,7 @@ fn acquire_pooled_buffer(
         }
         Ok(buf)
     } else {
+        log::debug!("Frame size {needed} exceeds MAX_BUCKET, falling back to non-pooled allocation");
         let mut buf = gstreamer::Buffer::with_size(needed)
             .context("allocate large non-pooled buffer")?;
         {
