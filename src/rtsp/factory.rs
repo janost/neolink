@@ -189,7 +189,10 @@ pub(super) async fn make_factory(
                             stream_config.update_from_media(&media);
                             buffer.push(media);
                             if stream_config.enable_low_latency {
-                                if stream_config.vid_type.is_some() || frame_count > 3 {
+                                if frame_count > 5
+                                    || (stream_config.vid_type.is_some()
+                                        && stream_config.aud_type.is_some())
+                                {
                                     break;
                                 }
                             } else if frame_count > 10
