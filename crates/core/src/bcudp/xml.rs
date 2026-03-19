@@ -85,10 +85,13 @@ impl UdpXml {
         // ))?;
         writer
             .create_element("P2P")
-            .write_inner_content::<_, quick_xml::de::DeError>(|writer| {
-                writer.write_serializable("", &self)?;
+            .write_inner_content(|writer| {
+                writer.write_serializable("", &self).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::Other, e)
+                })?;
                 Ok(())
-            })?;
+            })
+            .map_err(|e| quick_xml::de::DeError::from(quick_xml::Error::Io(std::sync::Arc::new(e))))?;
 
         Ok(w)
     }

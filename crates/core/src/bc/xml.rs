@@ -168,7 +168,7 @@ impl BcXml {
     pub(crate) fn try_parse(s: impl BufRead) -> Result<Self, quick_xml::de::DeError> {
         quick_xml::de::from_reader(s)
     }
-    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::se::SeError> {
         let mut writer = quick_xml::writer::Writer::new(&mut w);
         writer
             .write_event(quick_xml::events::Event::Decl(
@@ -184,7 +184,7 @@ impl Extension {
     pub(crate) fn try_parse(s: impl BufRead) -> Result<Self, quick_xml::de::DeError> {
         quick_xml::de::from_reader(s)
     }
-    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::de::DeError> {
+    pub(crate) fn serialize<W: Write>(&self, mut w: W) -> Result<W, quick_xml::se::SeError> {
         let mut writer = quick_xml::writer::Writer::new(&mut w);
         writer
             .write_event(quick_xml::events::Event::Decl(
