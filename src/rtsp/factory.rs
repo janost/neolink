@@ -273,19 +273,27 @@ pub(super) async fn make_factory(
 
                             log::trace!("{name}::{stream}: Sending new frames");
                             while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
+                                let frames = if stream_config.enable_low_latency {
+                                    drain_to_latest(data, &mut media_rx)
+                                } else {
+                                    vec![data]
+                                };
+
+                                for frame in frames {
+                                    let r = send_to_sources(
+                                        frame,
+                                        &mut pools,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
+                                        &stream_config,
+                                    );
+                                    if let Err(r) = &r {
+                                        log::info!("Failed to send to source: {r:?}");
+                                    }
+                                    r?;
                                 }
-                                r?;
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
@@ -308,6 +316,47 @@ pub(super) async fn make_factory(
     })
     .await?;
     Ok((factory, thread))
+}
+
+/// In low-latency mode, drain all immediately-available frames from the channel
+/// and return only the latest decodable set (from the last I-frame onward).
+/// If nothing was queued, returns the original frame as-is (zero overhead).
+fn drain_to_latest(
+    first: BcMedia,
+    rx: &mut tokio::sync::mpsc::Receiver<BcMedia>,
+) -> Vec<BcMedia> {
+    let mut frames = vec![first];
+    while let Ok(frame) = rx.try_recv() {
+        frames.push(frame);
+    }
+
+    if frames.len() <= 1 {
+        return frames;
+    }
+
+    let last_iframe_idx = frames.iter().rposition(|f| matches!(f, BcMedia::Iframe(_)));
+
+    match last_iframe_idx {
+        Some(idx) => {
+            if idx > 0 {
+                log::info!(
+                    "Low-latency: dropping {} stale frames, skipping to latest I-frame",
+                    idx
+                );
+            }
+            frames.split_off(idx)
+        }
+        None => {
+            let dropped = frames.len() - 1;
+            if dropped > 0 {
+                log::debug!(
+                    "Low-latency: dropping {} frames (no I-frame in batch)",
+                    dropped
+                );
+            }
+            vec![frames.pop().unwrap()]
+        }
+    }
 }
 
 fn send_to_sources(
@@ -334,6 +383,7 @@ fn send_to_sources(
                         aac.data,
                         Duration::from_micros(*aud_ts),
                         pools,
+                        stream_config.enable_low_latency,
                     )?;
                 }
             }
@@ -354,6 +404,7 @@ fn send_to_sources(
                         adpcm.data,
                         Duration::from_micros(*aud_ts),
                         pools,
+                        stream_config.enable_low_latency,
                     )?;
                 }
             }
@@ -363,7 +414,13 @@ fn send_to_sources(
         | BcMedia::Pframe(BcMediaPframe { data, .. }) => {
             if let Some(vid_src) = vid_src.as_ref() {
                 log::trace!("Sending VID: {:?}", Duration::from_micros(*vid_ts));
-                send_to_appsrc(vid_src, data, Duration::from_micros(*vid_ts), pools)?;
+                send_to_appsrc(
+                    vid_src,
+                    data,
+                    Duration::from_micros(*vid_ts),
+                    pools,
+                    stream_config.enable_low_latency,
+                )?;
             }
             const MICROSECONDS: u64 = 1000000;
             *vid_ts += MICROSECONDS / stream_config.fps as u64;
@@ -439,6 +496,7 @@ fn send_to_appsrc(
     data: Vec<u8>,
     mut ts: Duration,
     pools: &mut HashMap<usize, gstreamer::BufferPool>,
+    low_latency: bool,
 ) -> AnyResult<()> {
     check_live(appsrc)?;
 
@@ -472,12 +530,15 @@ fn send_to_appsrc(
         Err(e) => return Err(anyhow!("Error in streaming: {e:?}")),
     }
 
-    let level = appsrc.current_level_bytes();
-    let max = appsrc.max_bytes();
-    if level >= max * 2 / 3 && matches!(appsrc.current_state(), gstreamer::State::Paused) {
-        let _ = appsrc.set_state(gstreamer::State::Playing);
-    } else if level <= max / 3 && matches!(appsrc.current_state(), gstreamer::State::Playing) {
-        let _ = appsrc.set_state(gstreamer::State::Paused);
+    if !low_latency {
+        let level = appsrc.current_level_bytes();
+        let max = appsrc.max_bytes();
+        if level >= max * 2 / 3 && matches!(appsrc.current_state(), gstreamer::State::Paused) {
+            let _ = appsrc.set_state(gstreamer::State::Playing);
+        } else if level <= max / 3 && matches!(appsrc.current_state(), gstreamer::State::Playing)
+        {
+            let _ = appsrc.set_state(gstreamer::State::Paused);
+        }
     }
 
     Ok(())
@@ -558,14 +619,14 @@ fn pipe_h264(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
@@ -611,14 +672,14 @@ fn pipe_h265(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
     let source = make_element("appsrc", "vidsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
@@ -666,14 +727,14 @@ fn pipe_aac(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
@@ -754,14 +815,14 @@ fn pipe_adpcm(bin: &Element, block_size: u32, stream_config: &StreamConfig) -> R
     let source = make_element("appsrc", "audsrc")?
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     source.set_caps(Some(
@@ -828,14 +889,14 @@ fn pipe_silence(bin: &Element, stream_config: &StreamConfig) -> Result<Linked> {
         .dynamic_cast::<AppSrc>()
         .map_err(|_| anyhow!("Cannot cast to appsrc."))?;
 
-    source.set_is_live(false);
+    source.set_is_live(stream_config.enable_low_latency);
     source.set_block(false);
     if stream_config.enable_low_latency {
         source.set_min_latency(1000 / (stream_config.fps as i64));
     }
     source.set_property("emit-signals", false);
     source.set_max_bytes(buffer_size as u64);
-    source.set_do_timestamp(false);
+    source.set_do_timestamp(stream_config.enable_low_latency);
     source.set_stream_type(AppStreamType::Stream);
 
     let source = source
